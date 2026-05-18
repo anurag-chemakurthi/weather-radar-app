@@ -1,0 +1,518 @@
+import boto3
+import botocore
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from datetime import datetime, timedelta
+import geopandas as gpd
+from matplotlib.animation import FuncAnimation
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+import os
+import pandas as pd
+import pyart
+from PyQt5.QtCore import QDate
+from PyQt5.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDateEdit, QLabel, QMainWindow,
+    QMessageBox, QPushButton, QHBoxLayout, QVBoxLayout, QWidget
+)
+import re
+import requests
+from shapely.geometry import Point
+import sys
+import zipfile
+
+def download_all_csv_files():
+    """Download and extract necessary CSV files."""
+    def download_csv(csv_file):
+        if csv_file == "USCities.csv":
+            url = "https://simplemaps.com/static/data/us-cities/1.79/basic/simplemaps_uscities_basicv1.79.zip"
+        elif csv_file == "Weather_Radar_Stations.csv":
+            url = "https://www.kaggle.com/api/v1/datasets/download/thedevastator/locations-of-us-nexrad-and-tdwr-radar-stations"
+        
+        # Extract the filename from the URL or response headers
+        response = requests.head(url)
+        if 'Content-Disposition' in response.headers:
+            zip_file_name = response.headers['Content-Disposition'].split('=')[1].strip('"')
+        else:
+            zip_file_name = os.path.basename(url)
+        
+        # Download and extract the zip file to the current directory
+        response = requests.get(url)
+        with open(zip_file_name, 'wb') as file:
+            file.write(response.content)
+        extract_to = os.getcwd()
+        with zipfile.ZipFile(zip_file_name, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+        os.remove(zip_file_name)
+        if csv_file == "USCities.csv":
+            os.rename("uscities.csv","USCities.csv")
+            for file_name in ["uscities.xlsx", "license.txt"]:
+                try:
+                    os.remove(os.path.join(extract_to, file_name))
+                except FileNotFoundError:
+                    pass
+    for filename in ["USCities.csv","Weather_Radar_Stations.csv"]:
+        if not os.path.isfile(filename):
+            print(f"Downloading {filename}")
+            download_csv(filename)
+        else:
+            print(f"Using {filename} found in current directory.")
+    print("")
+
+# Ensure CSV files are downloaded before initializing the GUI
+download_all_csv_files()
+
+class InteractiveUSMap(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Interactive US Map with Radar Data and Toggleable Layers")
+        
+        # Array to store radar maps for animation
+        self.radar_frames = []  # List of tuples: [(figure, time), ...]
+        
+        # Selected radar station and zoom state
+        self.selected_station = None
+        self.zoomed_in = False  # Tracks if map is zoomed into a state
+        
+        # Central widget
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        main_layout = QHBoxLayout(self.central_widget)
+        
+        # Left side: Map layout
+        left_layout = QVBoxLayout()
+        main_layout.addLayout(left_layout, stretch=5)
+        
+        # Map figure
+        self.figure = Figure(figsize=(12, 8))
+        self.ax = self.figure.add_subplot(111, projection=ccrs.PlateCarree())
+        self.ax.set_extent([-130, -60, 20, 55], ccrs.PlateCarree())
+        self.ax.coastlines()
+        self.ax.add_feature(cfeature.BORDERS, linestyle=":")
+        self.ax.add_feature(cfeature.STATES, linestyle=":")
+        
+        # Matplotlib canvas
+        self.canvas = FigureCanvas(self.figure)
+        left_layout.addWidget(self.canvas)
+        
+        # Back button
+        self.back_button = QPushButton("Back to Full US Map")
+        self.back_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-size: 16px;
+                border-radius: 8px;
+                padding: 10px 20px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        self.back_button.clicked.connect(self.reset_map)
+        left_layout.addWidget(self.back_button)
+        
+        # Right side: Controls layout
+        right_widget = QWidget()
+        right_widget.setFixedWidth(290)
+        main_layout.addWidget(right_widget)
+        
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Date selection
+        right_layout.addWidget(QLabel("Date:"))
+        self.date_picker = QDateEdit()
+        self.date_picker.setCalendarPopup(True)
+        self.date_picker.setDate(QDate.currentDate())
+        right_layout.addWidget(self.date_picker)
+        
+        available_times = [
+            "00:00", "00:30",
+            "01:00", "01:30",
+            "02:00", "02:30",
+            "03:00", "03:30",
+            "04:00", "04:30",
+            "05:00", "05:30",
+            "06:00", "06:30",
+            "07:00", "07:30",
+            "08:00", "08:30",
+            "09:00", "09:30",
+            "10:00", "10:30",
+            "11:00", "11:30",
+            "12:00", "12:30",
+            "13:00", "13:30",
+            "14:00", "14:30",
+            "15:00", "15:30",
+            "16:00", "16:30",
+            "17:00", "17:30",
+            "18:00", "18:30",
+            "19:00", "19:30",
+            "20:00", "20:30",
+            "21:00", "21:30",
+            "22:00", "22:30",
+            "23:00", "23:30",
+            "23:59"
+        ]
+        
+        # Time selection
+        right_layout.addWidget(QLabel("Time (Start-End):"))
+        time_layout = QHBoxLayout()
+        self.start_time = QComboBox()
+        self.start_time.addItems(available_times)
+        time_layout.addWidget(self.start_time)
+        self.end_time = QComboBox()
+        self.end_time.addItems(available_times)
+        time_layout.addWidget(self.end_time)
+        right_layout.addLayout(time_layout)
+        
+        # Layer toggles
+        self.timezone_checkbox = QCheckBox("Show Time Zones")
+        self.timezone_checkbox.setChecked(True)
+        self.timezone_checkbox.stateChanged.connect(self.plot_full_map)
+        right_layout.addWidget(self.timezone_checkbox)
+        
+        self.radar_checkbox = QCheckBox("Show Radar Towers")
+        self.radar_checkbox.setChecked(True)
+        self.radar_checkbox.stateChanged.connect(self.plot_full_map)
+        right_layout.addWidget(self.radar_checkbox)
+        
+        self.cities_checkbox = QCheckBox("Show Cities")
+        self.cities_checkbox.setChecked(False)
+        self.cities_checkbox.stateChanged.connect(self.plot_full_map)
+        right_layout.addWidget(self.cities_checkbox)
+        
+        self.show_counties_checkbox = QCheckBox("Show Counties in \nZoomed-Out View")
+        self.show_counties_checkbox.setChecked(False)
+        self.show_counties_checkbox.stateChanged.connect(self.plot_full_map)
+        right_layout.addWidget(self.show_counties_checkbox)
+        
+        fetch_button = QPushButton("Fetch and Plot Radar Data")
+        fetch_button.clicked.connect(self.fetch_radar_data)
+        right_layout.addWidget(fetch_button)
+        
+        right_layout.addStretch()
+        
+        # Load data
+        self.load_map_data()
+        self.load_radar_data()
+        self.load_city_data()
+        self.load_county_data()
+        self.plot_full_map()
+        
+        # Map events
+        self.figure.canvas.mpl_connect("button_press_event", self.on_map_click)
+        self.figure.canvas.mpl_connect("motion_notify_event", self.on_hover)
+    
+    def reset_map(self):
+        """Reset to the full US map and disable radar selection."""
+        self.zoomed_in = False
+        self.plot_full_map()
+    
+    def load_map_data(self):
+        shapefile_url = "https://www2.census.gov/geo/tiger/GENZ2018/shp/cb_2018_us_state_500k.zip"
+        self.us_map = gpd.read_file(shapefile_url)
+        self.us_map = self.us_map[~self.us_map['STUSPS'].isin(['AK', 'HI', 'AS', 'GU', 'MP', 'PR', 'VI'])]
+    
+    def load_radar_data(self):
+        self.radar_data = pd.read_csv("Weather_Radar_Stations.csv")
+        self.radar_data['geometry'] = self.radar_data.apply(lambda row: Point(row['X'], row['Y']), axis=1)
+        self.radar_gdf = gpd.GeoDataFrame(self.radar_data, geometry='geometry', crs="EPSG:4326")
+    
+    def load_city_data(self):
+        self.city_data = pd.read_csv("USCities.csv")
+        self.city_data = self.city_data[['city', 'state_id', 'lat', 'lng', 'density']]
+        density_threshold = self.city_data['density'].quantile(0.95)
+        self.city_data = self.city_data[self.city_data['density'] >= density_threshold]
+    
+    def load_county_data(self):
+        county_shapefile_url = "https://www2.census.gov/geo/tiger/GENZ2018/shp/cb_2018_us_county_500k.zip"
+        self.county_data = gpd.read_file(county_shapefile_url)
+    
+    def plot_full_map(self):
+        self.ax.clear()
+        self.ax.set_extent([-125, -66, 24, 50], ccrs.PlateCarree())
+        gl = self.ax.gridlines(draw_labels=True, crs=ccrs.PlateCarree(), linewidth=0.5, color="gray", alpha=0.5)
+        gl.top_labels = False
+        gl.right_labels = False
+        gl.xlabel_style = {"size": 10, "color": "black"}
+        gl.ylabel_style = {"size": 10, "color": "black"}
+        
+        if self.timezone_checkbox.isChecked():
+            self.plot_time_zones()
+        
+        self.ax.coastlines()
+        self.ax.add_feature(cfeature.BORDERS, linestyle=":")
+        self.ax.add_feature(cfeature.STATES, linestyle=":")
+        
+        self.us_map.plot(ax=self.ax, color="lightblue", edgecolor="black")
+        
+        if self.show_counties_checkbox.isChecked():
+            self.county_data.plot(ax=self.ax, color="none", edgecolor="gray", alpha=0.5)
+        
+        if self.radar_checkbox.isChecked():
+            self.ax.scatter(
+                self.radar_data["X"], self.radar_data["Y"],
+                color="green", s=5, label="Radar Towers", transform=ccrs.PlateCarree()
+            )
+        
+        if self.cities_checkbox.isChecked():
+            self.ax.scatter(
+                self.city_data["lng"], self.city_data["lat"],
+                color="red", s=5, label="Cities", transform=ccrs.PlateCarree()
+            )
+        
+        self.ax.legend(loc="upper right")
+        self.canvas.draw()
+    
+    def plot_time_zones(self):
+        time_zones = {
+            "Eastern": {"bounds": (-86, -65), "color": "#add8e6"},
+            "Central": {"bounds": (-102, -86), "color": "#ffcccb"},
+            "Mountain": {"bounds": (-115, -102), "color": "#90ee90"},
+            "Pacific": {"bounds": (-125, -115), "color": "#fffacd"},
+        }
+        for name, tz in time_zones.items():
+            self.ax.add_patch(mpatches.Rectangle(
+                (tz["bounds"][0], 24), tz["bounds"][1] - tz["bounds"][0], 26,
+                color=tz["color"], alpha=0.5, label=f"{name} Time Zone")
+            )
+    
+    def on_map_click(self, event):
+        """Handle clicks to zoom into a state or fetch radar data."""
+        if event.xdata is None or event.ydata is None:
+            return
+        
+        clicked_lon, clicked_lat = event.xdata, event.ydata
+        clicked_point = Point(clicked_lon, clicked_lat)
+        
+        if self.zoomed_in:
+            # Allow radar tower selection only if zoomed in
+            nearest_station = self.get_nearest_station(clicked_lat, clicked_lon)
+            if nearest_station:
+                self.selected_station = nearest_station
+                QMessageBox.information(self, "Station Selected", f"You selected station: {nearest_station}")
+                return
+        else:
+            # Check for state click to zoom
+            for _, state_row in self.us_map.iterrows():
+                if state_row.geometry.contains(clicked_point):
+                    self.zoom_into_state(state_row)
+                    return
+    
+    def zoom_into_state(self, state_row):
+        """Zoom into a specific state and enable radar tower selection."""
+        self.ax.clear()
+        self.zoomed_in = True  # Enable radar selection when zoomed in
+        
+        minx, miny, maxx, maxy = state_row.geometry.bounds
+        self.ax.set_extent([minx, maxx, miny, maxy], ccrs.PlateCarree())
+        
+        state_fips = state_row["STATEFP"]
+        counties_in_state = self.county_data[self.county_data["STATEFP"] == state_fips]
+        counties_in_state.plot(ax=self.ax, color="lightblue", edgecolor="black", alpha=0.7)
+        
+        radar_in_state = self.radar_gdf[self.radar_gdf.within(state_row.geometry)]
+        if self.radar_checkbox.isChecked():
+            self.ax.scatter(
+                radar_in_state.geometry.x, radar_in_state.geometry.y,
+                color="green", s=10, alpha=1, label="Radar Towers", transform=ccrs.PlateCarree()
+            )
+            for _, radar in radar_in_state.iterrows():
+                self.ax.text(
+                    radar.geometry.x, radar.geometry.y, radar["siteID"],
+                    fontsize=8, ha="right", color="black", transform=ccrs.PlateCarree()
+                )
+        
+        if self.cities_checkbox.isChecked():
+            cities_in_state = self.city_data[
+                (self.city_data["lng"] >= minx) & (self.city_data["lng"] <= maxx) &
+                (self.city_data["lat"] >= miny) & (self.city_data["lat"] <= maxy)
+            ]
+            self.ax.scatter(
+                cities_in_state["lng"], cities_in_state["lat"],
+                color="red", s=5, alpha=1, label="Cities", transform=ccrs.PlateCarree()
+            )
+            for _, city in cities_in_state.iterrows():
+                self.ax.text(
+                    city["lng"], city["lat"], city["city"],
+                    fontsize=8, ha="left", color="darkred", transform=ccrs.PlateCarree()
+                )
+        
+        state_name = state_row["NAME"]
+        self.ax.set_title(f"Zoomed into: {state_name}")
+        self.ax.legend(loc="upper right")
+        self.canvas.draw()
+    
+    def on_hover(self, event):
+        """Handle hovering to show state names in the zoomed-out view
+        and state + county names in the zoomed-in view."""
+        if event.xdata is None or event.ydata is None:
+            self.ax.set_title("")  # Clear the title when not hovering
+            self.canvas.draw()
+            return
+        
+        hovered_lon, hovered_lat = event.xdata, event.ydata
+        hovered_point = Point(hovered_lon, hovered_lat)
+        
+        # Determine the current map limits
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        
+        # Default bounds for the full US map
+        zoom_threshold = (-125, -66, 24, 50)
+        
+        if xlim == zoom_threshold[0:2] and ylim == zoom_threshold[2:4]:
+            # Zoomed-out view: Show state names
+            for _, state_row in self.us_map.iterrows():
+                if state_row.geometry.contains(hovered_point):
+                    state_name = state_row['NAME']
+                    self.ax.set_title(f"State: {state_name}")
+                    self.canvas.draw()
+                    return
+            # If no state is hovered over, reset the title
+            self.ax.set_title("Continental US Map with Cities, Counties, and Toggleable Layers")
+            self.canvas.draw()
+        else:
+            # Zoomed-in view: Show state and county names
+            for _, county_row in self.county_data.iterrows():
+                if county_row.geometry.contains(hovered_point):
+                    county_name = county_row['NAME']
+                    for _, state_row in self.us_map.iterrows():
+                        if state_row.geometry.contains(hovered_point):
+                            state_name = state_row['NAME']
+                            self.ax.set_title(f"State: {state_name}, County: {county_name}")
+                            self.canvas.draw()
+                            return
+            # If no county is hovered over, reset the title
+            self.ax.set_title("")
+            self.canvas.draw()
+    
+    def get_nearest_station(self, lat, lon):
+        nearest_station = None
+        min_distance = float("inf")
+        for _, radar in self.radar_gdf.iterrows():
+            distance = ((lat - radar.geometry.y) ** 2 + (lon - radar.geometry.x) ** 2) ** 0.5
+            if distance < min_distance:
+                min_distance = distance
+                nearest_station = radar["siteID"]
+        return nearest_station
+    
+    def fetch_radar_data(self):
+        if not self.selected_station:
+            QMessageBox.warning(self, "No Station Selected", "Please select a radar station on the map first.")
+            return
+        
+        year = self.date_picker.date().year()
+        month = self.date_picker.date().month()
+        day = self.date_picker.date().day()
+        start_time = self.start_time.currentText().replace(":", "")
+        start_time += "00"
+        end_time = self.end_time.currentText().replace(":","")
+        end_time += "59" if end_time == "2359" else "00"
+        
+        try:
+            s3 = boto3.client('s3', config=botocore.config.Config(signature_version=botocore.UNSIGNED))
+            prefix = f'{year}/{month:02}/{day:02}/{self.selected_station}/{self.selected_station}{year}{month:02}{day:02}_'
+            response = s3.list_objects_v2(Bucket='noaa-nexrad-level2', Prefix=prefix)
+            
+            if 'Contents' not in response:
+                print("No files found for the specified date and station.")
+                return []
+            
+            time_pattern = re.compile(r'_(\d{6})_V06')
+            files = [
+                (obj['Key'], time_pattern.search(obj['Key']).group(1))
+                for obj in response['Contents']
+                if time_pattern.search(obj['Key'])
+            ]
+            
+            start_time = datetime.strptime(start_time, '%H%M%S').replace(year=year, month=month, day=day)
+            end_time = datetime.strptime(end_time, '%H%M%S').replace(year=year, month=month, day=day)
+            files = [(key, datetime.strptime(time, '%H%M%S').replace(year=year, month=month, day=day)) for key, time in files]
+            files.sort(key=lambda x: x[1])
+            filtered_files = [(key, time) for key, time in files if start_time <= time <= end_time]
+            
+            print("\nFiles in the time range:")
+            for key, time in filtered_files:
+                print(key)
+            
+            self.radar_frames = []
+            print("\nExtracting files...")
+            for key, time in filtered_files:
+                if '_MDM' in key:
+                    print(f"Metadata file. Skipping {key}")
+                    continue
+                try:
+                    file_url = f's3://noaa-nexrad-level2/{key}'
+                    print(f"Extracting {key}")
+                    radar = pyart.io.read_nexrad_archive(file_url)
+                    self.store_radar_frame(radar, time)
+                except OSError as e:
+                    print(f"Error reading {file_url}: {e}")
+            print("All files downloaded.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to fetch radar data: {e}")
+        self.animate_radar_data()
+    
+    def generate_time_range(self, start, end):
+        start = datetime.strptime(start, "%H%M%S")
+        end = datetime.strptime(end, "%H%M%S")
+        result = []
+        current = start
+        while current <= end:
+            result.append(current.strftime("%H%M%S"))
+            current += timedelta(minutes=1)
+        return sorted(result)
+    
+    def store_radar_frame(self, radar, time):
+        """Store radar data frame for later animation."""
+        figure = Figure(figsize=(12, 6))
+        ax = figure.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+        display = pyart.graph.RadarMapDisplay(radar)
+        display.plot_ppi_map(
+            "reflectivity",
+            sweep=0,
+            ax=ax,
+            title=f"Reflectivity (dBZ) at {time}",
+            colorbar_label="Reflectivity",
+            vmin=-20,
+            vmax=60
+        )
+        ax.coastlines()
+        ax.add_feature(cfeature.BORDERS, linestyle=":")
+        ax.add_feature(cfeature.STATES, linestyle=":")
+        
+        # Convert figure to canvas and store for animation
+        canvas = FigureCanvas(figure)
+        self.radar_frames.append((canvas, time))
+    
+    def animate_radar_data(self):
+        """Animate the stored radar maps."""
+        if not self.radar_frames:
+            QMessageBox.warning(self, "No Data", "No radar data available for animation.")
+            return
+        
+        plt.close()
+        
+        fig, ax = plt.subplots(figsize=(12, 6), subplot_kw={'projection': ccrs.PlateCarree()})
+        ax.set_title("Radar Animation")
+        ax.set_axis_off()
+        
+        def update(frame):
+            ax.clear()
+            canvas, timestamp = self.radar_frames[frame]
+            canvas.draw()
+            ax.imshow(canvas.buffer_rgba(), extent=ax.get_extent(), transform=ccrs.PlateCarree())
+            ax.set_title(f"Radar Time: {timestamp}")
+        
+        self.ani = FuncAnimation(fig, update, frames=len(self.radar_frames), repeat=True)
+        plt.show()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    main_window = InteractiveUSMap()
+    main_window.show()
+    sys.exit(app.exec_())
