@@ -1,0 +1,10 @@
+boto3
+botocore
+cartopy
+geopandas
+matplotlib
+pandas
+arm_pyart
+PyQt5
+requests
+shapely
